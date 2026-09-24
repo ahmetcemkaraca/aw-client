@@ -19,6 +19,7 @@ from typing import (
 )
 
 import persistqueue
+import queue
 import requests as req
 from aw_core.dirs import get_data_dir
 from aw_core.models import Event
@@ -26,6 +27,7 @@ from aw_transform.heartbeats import heartbeat_merge
 
 from .config import load_config, load_local_server_api_key
 from .singleinstance import SingleInstance
+from .capture import load_policy, filter_data, clip_interval
 
 # FIXME: This line is probably badly placed
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -33,12 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 def _log_request_exception(e: req.RequestException):
-    logger.warning(str(e))
-    try:
-        d = e.response.json() if e.response else None
-        logger.warning(f"Error message received: {d}")
-    except json.JSONDecodeError:
-        pass
+    status = e.response.status_code if e.response is not None else "unavailable"
+    logger.warning("Local activity request failed (status %s)", status)
 
 
 def _dt_is_tzaware(dt: datetime) -> bool:
@@ -49,6 +47,11 @@ def always_raise_for_request_errors(f: Callable[..., req.Response]):
     @functools.wraps(f)
     def g(*args, **kwargs):
         r = f(*args, **kwargs)
+        if r.status_code == 401 and args[0]._refresh_local_session():
+            r = f(*args, **kwargs)  # 401 is rejected before the write handler executes.
+        replacement = r.headers.get("X-PeakActivity-Token", "")
+        if len(replacement) == 64 and all(char in "0123456789abcdef" for char in replacement):
+            args[0].server_api_key = replacement
         try:
             r.raise_for_status()
         except req.RequestException as e:
@@ -79,6 +82,8 @@ class ActivityWatchClient:
             :lines: 7-
         """
         self.testing = testing
+        self.capture_policy = load_policy()
+        self.capture_continuous = set()
 
         self.client_name = client_name
         self.client_hostname = socket.gethostname()
@@ -89,12 +94,23 @@ class ActivityWatchClient:
 
         server_host = host or server_config["hostname"]
         server_port = port or server_config["port"]
+        if str(server_host).lower() not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("The local API client only accepts loopback hosts")
+        if protocol != "http":
+            raise ValueError("The local API client only accepts HTTP")
         self.server_api_key = load_local_server_api_key(str(server_host), server_port)
-        self.server_address = f"{protocol}://{server_host}:{server_port}"
+        host_authority = f"[{server_host}]" if str(server_host) == "::1" else str(server_host)
+        self.server_address = f"http://{host_authority}:{server_port}"
+        self.server_refresh_key = os.environ.get("PEAKACTIVITY_API_REFRESH") if os.environ.get("PEAKACTIVITY_API_TOKEN") else None
+        if self.server_refresh_key and protocol != "http":
+            raise ValueError("Local capture credentials require the exact local HTTP origin")
 
         self.instance = SingleInstance(
             f"{self.client_name}-at-{server_host}-on-{server_port}"
         )
+
+        self._session = req.Session()
+        self._session.trust_env = False
 
         self.commit_interval = client_config["commit_interval"]
 
@@ -107,6 +123,20 @@ class ActivityWatchClient:
     #   Get/Post base requests
     #
 
+    def _refresh_local_session(self) -> bool:
+        if not self.server_refresh_key:
+            return False
+        response = self._session.post(self._url("session/refresh"),
+                            json={"refresh_token": self.server_refresh_key},
+                            allow_redirects=False, timeout=10)
+        if response.status_code != 200:
+            return False
+        value = response.json().get("access_token", "")
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            return False
+        self.server_api_key = value
+        return True
+
     def _url(self, endpoint: str):
         return f"{self.server_address}/api/0/{endpoint}"
 
@@ -118,7 +148,7 @@ class ActivityWatchClient:
 
     @always_raise_for_request_errors
     def _get(self, endpoint: str, params: Optional[dict] = None) -> req.Response:
-        return req.get(self._url(endpoint), params=params, headers=self._headers())
+        return self._session.get(self._url(endpoint), params=params, headers=self._headers(), allow_redirects=False, timeout=10)
 
     @always_raise_for_request_errors
     def _post(
@@ -130,11 +160,13 @@ class ActivityWatchClient:
         headers = self._headers(
             {"Content-type": "application/json", "charset": "utf-8"}
         )
-        return req.post(
+        return self._session.post(
             self._url(endpoint),
             data=bytes(json.dumps(data), "utf8"),
             headers=headers,
             params=params,
+            allow_redirects=False,
+            timeout=10,
         )
 
     @always_raise_for_request_errors
@@ -142,7 +174,7 @@ class ActivityWatchClient:
         if data is None:
             data = {}
         headers = self._headers({"Content-type": "application/json"})
-        return req.delete(self._url(endpoint), data=json.dumps(data), headers=headers)
+        return self._session.delete(self._url(endpoint), data=json.dumps(data), headers=headers, allow_redirects=False, timeout=10)
 
     def get_info(self):
         """Returns a dict currently containing the keys 'hostname' and 'testing'."""
@@ -163,7 +195,7 @@ class ActivityWatchClient:
             event = self._get(endpoint).json()
             return Event(**event)
         except req.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 404:
+            if e.response is not None and e.response.status_code == 404:
                 return None
             else:
                 raise
@@ -228,6 +260,10 @@ class ActivityWatchClient:
         response = self._get(endpoint, params=params)
         return int(response.text)
 
+    def break_capture_chain(self, bucket_id: str) -> None:
+        self.last_heartbeat.pop(bucket_id, None)
+        self.capture_continuous.discard(bucket_id)
+
     def heartbeat(
         self,
         bucket_id: str,
@@ -251,6 +287,25 @@ class ActivityWatchClient:
 
         endpoint = f"buckets/{bucket_id}/heartbeat?pulsetime={pulsetime}"
         _commit_interval = commit_interval or self.commit_interval
+
+        if self.capture_policy is not None:
+            interval = clip_interval(self.capture_policy, event.timestamp, event.duration)
+            if interval is None:
+                self.break_capture_chain(bucket_id)
+                return None
+            start, duration = interval
+            data = filter_data(self.capture_policy, bucket_id, event.data, start, duration)
+            if data is None:
+                self.break_capture_chain(bucket_id)
+                return None
+            if bucket_id not in self.capture_continuous:
+                data["capture_break"] = True
+                self.capture_continuous.add(bucket_id)
+            event = Event(timestamp=start, duration=duration, data=data)
+            # Native capture waits for the encrypted vault's durable acknowledgment;
+            # pre-merging here would lose the final cached interval on pause/exit.
+            self._post(endpoint, event.to_json_dict())
+            return None
 
         if queued:
             self._warn_queue_before_connect()
@@ -449,26 +504,30 @@ class RequestQueue(threading.Thread):
 
         self._attempt_reconnect_interval = 10
 
-        # Setup failed queues file
-        data_dir = get_data_dir("aw-client")
-        queued_dir = os.path.join(data_dir, "queued")
-        if not os.path.exists(queued_dir):
-            os.makedirs(queued_dir)
+        if os.environ.get("PEAKACTIVITY_CAPTURE") == "1":
+            # A locked/unavailable vault must not spill raw activity to plaintext SQLite.
+            self._persistqueue = queue.Queue(maxsize=300)
+        else:
+            # Setup failed queues file
+            data_dir = get_data_dir("aw-client")
+            queued_dir = os.path.join(data_dir, "queued")
+            if not os.path.exists(queued_dir):
+                os.makedirs(queued_dir)
 
-        persistqueue_path = os.path.join(
-            queued_dir,
-            "{}{}.v{}.persistqueue".format(
-                self.client.client_name,
-                "-testing" if client.testing else "",
-                self.VERSION,
-            ),
-        )
+            persistqueue_path = os.path.join(
+                queued_dir,
+                "{}{}.v{}.persistqueue".format(
+                    self.client.client_name,
+                    "-testing" if client.testing else "",
+                    self.VERSION,
+                ),
+            )
 
-        logger.debug(f"queue path '{persistqueue_path}'")
+            logger.debug(f"queue path '{persistqueue_path}'")
 
-        self._persistqueue = persistqueue.FIFOSQLiteQueue(
-            persistqueue_path, multithreading=True, auto_commit=False
-        )
+            self._persistqueue = persistqueue.FIFOSQLiteQueue(
+                persistqueue_path, multithreading=True, auto_commit=False
+            )
         self._current = None  # type: Optional[QueuedRequest]
 
     def _get_next(self) -> Optional[QueuedRequest]:
@@ -477,7 +536,7 @@ class RequestQueue(threading.Thread):
         if not self._current:
             try:
                 self._current = self._persistqueue.get(block=False)
-            except persistqueue.exceptions.Empty:
+            except (persistqueue.exceptions.Empty, queue.Empty):
                 return None
         return self._current
 
@@ -532,22 +591,22 @@ class RequestQueue(threading.Thread):
             sleep(0.5)
             return
         except req.RequestException as e:
-            if e.response and e.response.status_code == 400:
+            if e.response is not None and e.response.status_code == 400:
                 # HTTP 400 - Bad request
                 # Example case: https://github.com/ActivityWatch/activitywatch/issues/815
                 # We don't want to retry, because a bad payload is likely to fail forever.
-                logger.error(f"Bad request, not retrying: {request.data}")
-            elif e.response and e.response.status_code == 500:
+                logger.error("Bad activity request, not retrying")
+            elif e.response is not None and e.response.status_code == 500:
                 # HTTP 500 - Internal server error
                 # It is possible that the server is in a bad state (and will recover on restart),
                 # in which case we want to retry. I hope this can never caused by a bad payload.
-                logger.error(f"Internal server error, retrying: {request.data}")
+                logger.error("Local server error, retrying")
                 sleep(0.5)
                 return
             else:
-                logger.exception(f"Unknown error, not retrying: {request.data}")
+                logger.error("Activity request failed, not retrying")
         except Exception:
-            logger.exception(f"Unknown error, not retrying: {request.data}")
+            logger.error("Activity request failed, not retrying")
 
         # Mark the request as done
         self._task_done()
@@ -577,7 +636,14 @@ class RequestQueue(threading.Thread):
         """
         assert "/heartbeat" in endpoint
         assert isinstance(data, dict)
-        self._persistqueue.put(QueuedRequest(endpoint, data))
+        if isinstance(self._persistqueue, queue.Queue):
+            try:
+                self._persistqueue.put(QueuedRequest(endpoint, data), timeout=1)
+            except queue.Full:
+                logger.error("Capture stopped: the local vault has been unavailable and the memory queue is full")
+                raise RuntimeError("Local capture queue is full; reconnect or unlock the vault") from None
+        else:
+            self._persistqueue.put(QueuedRequest(endpoint, data))
 
     def register_bucket(self, bucket_id: str, event_type: str) -> None:
         bucket = Bucket(bucket_id, event_type)

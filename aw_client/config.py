@@ -30,6 +30,17 @@ def load_config():
 
 
 def load_local_server_api_key(host: str, port: Union[int, str]) -> Optional[str]:
+    token = os.environ.get("PEAKACTIVITY_API_TOKEN")
+    if token:
+        from urllib.parse import urlsplit
+        origin = urlsplit(os.environ.get("PEAKACTIVITY_API_ORIGIN", ""))
+        if (host not in {"127.0.0.1", "localhost", "::1"}
+                or origin.scheme != "http" or origin.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or origin.port != int(port)):
+            raise ValueError("Refusing to send a local capture credential to a different server")
+        if len(token) != 64 or any(char not in "0123456789abcdef" for char in token):
+            raise ValueError("Invalid local capture credential")
+        return token
     if host not in {"127.0.0.1", "localhost", "::1"}:
         return None
 

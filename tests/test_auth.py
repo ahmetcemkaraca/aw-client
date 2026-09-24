@@ -1,4 +1,5 @@
 from typing import Any, Dict, Optional
+import pytest
 
 from aw_client import ActivityWatchClient
 from aw_client.config import load_local_server_api_key
@@ -8,6 +9,8 @@ from aw_client import client as client_module
 class DummyResponse:
     def __init__(self, data: Optional[Dict[str, Any]] = None):
         self._data = data or {}
+        self.status_code = 200
+        self.headers = {}
 
     def raise_for_status(self) -> None:
         return None
@@ -50,23 +53,29 @@ def test_client_sends_authorization_header_for_local_server(tmp_path, monkeypatc
         'port = 5600\n\n[auth]\napi_key = "secret123"\n',
     )
     monkeypatch.setattr(client_module, "SingleInstance", lambda name: object())
+    monkeypatch.setattr(client_module, "RequestQueue", lambda client: object())
 
     captured = {}
 
-    def fake_get(url, params=None, headers=None):
-        captured["url"] = url
-        captured["headers"] = headers
-        return DummyResponse({"hostname": "test-host", "testing": False})
+    class FakeSession:
+        trust_env = True
 
-    monkeypatch.setattr(client_module.req, "get", fake_get)
+        def get(self, url, params=None, headers=None, **kwargs):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["trust_env"] = self.trust_env
+            return DummyResponse({"hostname": "test-host", "testing": False})
+
+    monkeypatch.setattr(client_module.req, "Session", FakeSession)
 
     client = ActivityWatchClient("test-client", host="127.0.0.1", port=5600)
     assert client.get_info()["hostname"] == "test-host"
     assert captured["url"] == "http://127.0.0.1:5600/api/0/info"
     assert captured["headers"]["Authorization"] == "Bearer secret123"
+    assert captured["trust_env"] is False
 
 
-def test_client_skips_authorization_header_for_remote_server(tmp_path, monkeypatch):
+def test_client_rejects_remote_server_before_request(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     write_server_config(
         tmp_path,
@@ -74,15 +83,11 @@ def test_client_skips_authorization_header_for_remote_server(tmp_path, monkeypat
         'port = 5600\n\n[auth]\napi_key = "secret123"\n',
     )
     monkeypatch.setattr(client_module, "SingleInstance", lambda name: object())
+    monkeypatch.setattr(client_module, "RequestQueue", lambda client: object())
 
-    captured = {}
+    requested = []
+    monkeypatch.setattr(client_module.req, "Session", lambda: pytest.fail("remote request session created"))
 
-    def fake_get(url, params=None, headers=None):
-        captured["headers"] = headers
-        return DummyResponse({"hostname": "remote-host", "testing": False})
-
-    monkeypatch.setattr(client_module.req, "get", fake_get)
-
-    client = ActivityWatchClient("test-client", host="aw.example.com", port=5600)
-    assert client.get_info()["hostname"] == "remote-host"
-    assert "Authorization" not in captured["headers"]
+    with pytest.raises(ValueError, match="loopback"):
+        ActivityWatchClient("test-client", host="aw.example.com", port=5600)
+    assert requested == []
