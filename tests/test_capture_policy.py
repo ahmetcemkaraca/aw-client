@@ -80,3 +80,66 @@ def test_native_heartbeat_does_not_leave_a_premerge_interval_on_pause():
     assert client._post.call_args.args[1]["data"] == {"app": "Editor", "capture_break": True}
     client.request_queue.add_request.assert_not_called()
     assert client.last_heartbeat == {}
+
+
+def test_native_queued_bucket_is_created_before_first_idle_heartbeat():
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import pytest
+    import requests
+    from aw_client.client import ActivityWatchClient
+    from aw_core.models import Event
+
+    client = object.__new__(ActivityWatchClient)
+    client.client_name = "aw-watcher-afk"
+    client.client_hostname = "synthetic"
+    client.capture_policy = policy()
+    client.capture_continuous = set()
+    client.last_heartbeat = {}
+    client.commit_interval = 10
+    client.request_queue = Mock()
+    client._warn_queue_before_connect = Mock()
+    client.server_address = "http://127.0.0.1:5610"
+    client.server_api_key = "a" * 64
+    created = set()
+
+    def transport(url, **kwargs):
+        response = requests.Response()
+        response.url = url
+        response.status_code = 200
+        if "/heartbeat?" in url:
+            response.status_code = 200 if url.split("/heartbeat?")[0] in created else 404
+        else:
+            created.add(url)
+        return response
+
+    client._session = SimpleNamespace(post=Mock(side_effect=transport))
+    bucket = "aw-watcher-afk_synthetic"
+    client.create_bucket(bucket, "afkstatus", queued=True)
+    client.heartbeat(bucket, Event(timestamp=datetime.now(timezone.utc), data={"status": "not-afk"}), 185, queued=True)
+
+    calls = client._session.post.call_args_list
+    assert [call.args[0] for call in calls] == [
+        f"{client.server_address}/api/0/buckets/{bucket}",
+        f"{client.server_address}/api/0/buckets/{bucket}/heartbeat?pulsetime=185",
+    ]
+    assert json.loads(calls[0].kwargs["data"]) == {
+        "client": "aw-watcher-afk", "hostname": "synthetic", "type": "afkstatus",
+    }
+    assert json.loads(calls[1].kwargs["data"])["data"] == {"status": "not-afk", "capture_break": True}
+    client.request_queue.register_bucket.assert_not_called()
+    client.request_queue.add_request.assert_not_called()
+
+    response = requests.Response()
+    response.status_code = 503
+    client._session.post = Mock(return_value=response)
+    with pytest.raises(requests.HTTPError):
+        client.create_bucket(bucket, "afkstatus", queued=True)
+    client.request_queue.register_bucket.assert_not_called()
+
+    client.capture_policy = None
+    client._session.post.reset_mock()
+    client.create_bucket(bucket, "afkstatus", queued=True)
+    client.request_queue.register_bucket.assert_called_once_with(bucket, "afkstatus")
+    client._session.post.assert_not_called()
