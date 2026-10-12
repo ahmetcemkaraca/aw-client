@@ -343,7 +343,8 @@ class ActivityWatchClient:
         return self._get("buckets/").json()
 
     def create_bucket(self, bucket_id: str, event_type: str, queued=False):
-        if queued:
+        # Native heartbeats bypass the queue, so their bucket must already exist.
+        if queued and self.capture_policy is None:
             self._warn_queue_before_connect()
             self.request_queue.register_bucket(bucket_id, event_type)
         else:
